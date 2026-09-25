@@ -42,6 +42,12 @@ STATUS_REVOKED = "已撤权"
 EXPORT_APPROVED = "通过"
 EXPORT_BLOCKED = "阻断"
 ASSIGNMENT_OPEN = "进行中"
+# 同意导入的冲突状态：待裁定 / 已维持首次事实 / 后到内容经更正生效
+CONFLICT_PENDING = "待裁定"
+CONFLICT_UPHELD = "维持首次授权"
+CONFLICT_CORRECTED = "已更正"
+# 授权时间语义下的“不确定”（旧数据缺字段或时间不明），参与指纹但不臆造
+TIME_UNKNOWN = "未知时间"
 
 
 class SandboxError(Exception):
@@ -90,7 +96,13 @@ class Sandbox:
         self.cases: dict[str, dict] = {}
         # 快照按 (病例, 版本) 存放，任何版本一经发布不可改写
         self.snapshots: dict[tuple[str, int], dict] = {}
+        # 数据使用同意：键为同意编号，编号一经首次落账即绑定病例、课程范围、
+        # 授权时间与内容摘要（binding），此后不可改写
         self.consents: dict[str, dict] = {}
+        # 同意编号冲突账：同编号导入但关键字段变化时，只在此追加，绝不覆盖授权
+        self.consent_conflicts: dict[str, dict] = {}
+        # 授权人员对授权事实的更正记录：只追加，旧记录保持原样
+        self.consent_corrections: list[dict] = []
         self.policies: dict[str, dict] = {}
         # 分析环境按 (镜像, 版本) 存放；任务创建时钉住当时版本，升级不回溯
         self.environment_versions: dict[tuple[str, int], dict] = {}
@@ -102,6 +114,7 @@ class Sandbox:
         self.teacher_courses: list[dict] = []
         self.audit: list[dict] = []
         self._seq = 0
+        self._correction_seq = 0
 
     # ---- 装载 -----------------------------------------------------------
 
@@ -145,7 +158,16 @@ class Sandbox:
                 course_id=grant.get("course_id"),
                 granted_at=parse_time(grant["granted_at"]),
                 scope_note=grant.get("scope_note", ""),
+                content_summary=grant.get("content_summary", ""),
+                source=grant.get("source", "seed"),
+                import_batch=grant.get("import_batch"),
+                imported_at=parse_time(grant["imported_at"])
+                if grant.get("imported_at") else None,
             )
+        for correction in data.get("consent_corrections", []):
+            box._load_correction(correction)
+        for conflict in data.get("consent_conflicts", []):
+            box._load_conflict(conflict)
         for enrollment in data.get("enrollments", []):
             box.enroll(enrollment["student_id"], enrollment["course_id"],
                        status=enrollment.get("status"))
@@ -226,9 +248,15 @@ class Sandbox:
                     "current": f"{rec['id']}:v{rec['version']}",
                 })
             for grant in self.consents.values():
-                if grant["case_id"] != task["case_id"]:
-                    continue
-                if grant["course_id"] is not None and grant["course_id"] != task["course_id"]:
+                covers = [
+                    (b["case_id"], b["course_id"])
+                    for b in self._effective_bindings(
+                        grant, datetime.max if grant["withdrawn_at"] is None
+                        else grant["withdrawn_at"])
+                ]
+                if not any(case_id == task["case_id"]
+                           and (course_id is None or course_id == task["course_id"])
+                           for case_id, course_id in covers):
                     continue
                 if grant["withdrawn_at"]:
                     self._flag(assignment, {
@@ -330,19 +358,327 @@ class Sandbox:
             raise NotFound(f"分析环境 {env_id}:v{version} 不存在")
         return record
 
-    def grant_consent(self, consent_id: str, case_id: str,
-                      course_id: Optional[str], granted_at: datetime,
-                      scope_note: str = "") -> dict:
-        grant = {
-            "id": consent_id,
+    # ---- 同意登记：编号边界、重放、冲突 ----------------------------------
+
+    @staticmethod
+    def _consent_binding(case_id: str, course_id: Optional[str],
+                         granted_at: datetime, scope_note: str,
+                         content_summary: str) -> dict:
+        """同意编号首次落账时绑定的关键字段；任一字段变化即构成冲突。"""
+        return {
             "case_id": case_id,
             "course_id": course_id,  # None 表示覆盖所有教学用途
-            "granted_at": granted_at,
-            "withdrawn_at": None,
-            "scope_note": scope_note,
+            "granted_at": granted_at.isoformat() if granted_at else TIME_UNKNOWN,
+            "scope_note": scope_note or "",
+            "content_summary": content_summary or "",
         }
-        self.consents[consent_id] = grant
-        return grant
+
+    @staticmethod
+    def _binding_fingerprint(binding: dict) -> str:
+        return digest(binding)
+
+    @classmethod
+    def _consent_fingerprint(cls, case_id: str, course_id: Optional[str],
+                             granted_at: datetime, scope_note: str,
+                             content_summary: str) -> tuple[dict, str]:
+        binding = cls._consent_binding(
+            case_id, course_id, granted_at, scope_note, content_summary)
+        return binding, cls._binding_fingerprint(binding)
+
+    def grant_consent(self, consent_id: str, case_id: str,
+                      course_id: Optional[str], granted_at: datetime,
+                      scope_note: str = "", content_summary: str = "",
+                      *, source: str = "import",
+                      import_batch: Optional[str] = None,
+                      imported_at: Optional[datetime] = None) -> dict:
+        """登记一份数据使用同意（批量导入的落账口）。
+
+        编号首次落账后即绑定病例、课程范围、授权时间与内容摘要四要素：
+
+        - 四要素完全一致的重复导入：视为重放，原样返回首次记录，不产生新授权；
+        - 任一关键字段变化：保留首次事实不动，在冲突账登记一笔“待裁定”，
+          后到内容不获得任何能力（不覆盖授权、风险标记或审计）。
+
+        旧数据（无内容摘要）按空摘要参与绑定，保证与既有种子兼容。
+        """
+        if case_id not in self.cases:
+            raise NotFound(f"未知病例：{case_id}")
+        if course_id is not None and course_id not in self.courses:
+            raise NotFound(f"未知课程：{course_id}")
+        binding, fp = self._consent_fingerprint(
+            case_id, course_id, granted_at, scope_note, content_summary)
+        arrived_at = imported_at or granted_at
+
+        existing = self.consents.get(consent_id)
+        if existing is None:
+            grant = {
+                "id": consent_id,
+                "case_id": case_id,
+                "course_id": course_id,
+                "granted_at": granted_at,
+                "withdrawn_at": None,
+                "scope_note": scope_note or "",
+                "content_summary": content_summary or "",
+                "binding": binding,
+                "binding_fingerprint": fp,
+                "source": source,
+                "first_import_batch": import_batch,
+                "first_imported_at": arrived_at,
+                "replays": [],
+            }
+            self.consents[consent_id] = grant
+            self.audit.append({
+                "at": arrived_at.isoformat() if arrived_at else None,
+                "action": "同意首次落账", "consent_id": consent_id,
+                "case_id": case_id, "course_id": course_id,
+                "binding_fingerprint": fp, "source": source,
+                "import_batch": import_batch,
+            })
+            return grant
+
+        if existing["binding_fingerprint"] == fp:
+            # 完全一致的重复导入：幂等重放，返回原记录，不覆盖任何事实
+            replay = {
+                "at": arrived_at.isoformat() if arrived_at else None,
+                "source": source,
+                "import_batch": import_batch,
+            }
+            # 同批次的重复装载（例如恢复后重放种子）不重复计数
+            if not any(r["import_batch"] == import_batch and import_batch is not None
+                       for r in existing["replays"]):
+                existing["replays"].append(replay)
+                self.audit.append({
+                    "at": replay["at"], "action": "同意重复导入重放",
+                    "consent_id": consent_id, "import_batch": import_batch,
+                    "binding_fingerprint": fp, "result": "返回首次记录",
+                })
+            return existing
+
+        # 关键字段变化：绝不覆盖，登记冲突（同编号、同入向指纹只登记一次）
+        return self._register_conflict(
+            existing, binding, fp, arrived_at=arrived_at, source=source,
+            import_batch=import_batch)
+
+    def _register_conflict(self, existing: dict, incoming_binding: dict,
+                           incoming_fp: str, *, arrived_at: Optional[datetime],
+                           source: str, import_batch: Optional[str]) -> dict:
+        consent_id = existing["id"]
+        conflict = self.consent_conflicts.get(consent_id)
+        attempt = {
+            "at": arrived_at.isoformat() if arrived_at else None,
+            "source": source,
+            "import_batch": import_batch,
+            "binding": incoming_binding,
+            "binding_fingerprint": incoming_fp,
+        }
+        if conflict is None:
+            conflict = {
+                "consent_id": consent_id,
+                "status": CONFLICT_PENDING,
+                "first_binding": existing["binding"],
+                "first_binding_fingerprint": existing["binding_fingerprint"],
+                "first_source": existing["source"],
+                "first_imported_at": (existing["first_imported_at"].isoformat()
+                                      if existing["first_imported_at"] else None),
+                "attempts": [],
+                "resolution": None,
+            }
+            self.consent_conflicts[consent_id] = conflict
+        if not any(a["binding_fingerprint"] == incoming_fp
+                   and a["import_batch"] == import_batch
+                   for a in conflict["attempts"]):
+            conflict["attempts"].append(attempt)
+        self.audit.append({
+            "at": attempt["at"], "action": "同意编号冲突",
+            "consent_id": consent_id, "status": CONFLICT_PENDING,
+            "first_binding_fingerprint": existing["binding_fingerprint"],
+            "incoming_binding_fingerprint": incoming_fp,
+            "changed_fields": self._binding_diff(existing["binding"],
+                                                 incoming_binding),
+            "import_batch": import_batch,
+            "result": "保留首次事实，后到内容不授予能力",
+        })
+        # 始终返回首次记录：调用方拿到的授权事实不变
+        return existing
+
+    @staticmethod
+    def _binding_diff(first: dict, incoming: dict) -> list[str]:
+        labels = {
+            "case_id": "病例", "course_id": "课程范围",
+            "granted_at": "授权时间", "scope_note": "范围说明",
+            "content_summary": "内容摘要",
+        }
+        return [labels[k] for k in
+                ("case_id", "course_id", "granted_at", "scope_note",
+                 "content_summary")
+                if first.get(k) != incoming.get(k)]
+
+    def _load_conflict(self, data: dict) -> None:
+        """从序列化状态恢复冲突账，不重放导入判定。"""
+        self.consent_conflicts[data["consent_id"]] = {
+            "consent_id": data["consent_id"],
+            "status": data.get("status", CONFLICT_PENDING),
+            "first_binding": data["first_binding"],
+            "first_binding_fingerprint": data["first_binding_fingerprint"],
+            "first_source": data.get("first_source", "import"),
+            "first_imported_at": data.get("first_imported_at"),
+            "attempts": list(data.get("attempts", [])),
+            "resolution": data.get("resolution"),
+        }
+
+    def resolve_consent_conflict(self, consent_id: str, officer_id: str,
+                                 decision: str, now: datetime,
+                                 note: str = "") -> dict:
+        """隐私审核员裁定编号冲突。
+
+        - ``uphold``（默认）：维持首次授权事实，后到内容继续不获得能力；
+        - ``correct``：以“追加更正记录”的方式让后到内容生效，旧记录原样保留，
+          更正自裁定时刻起生效，绝不回溯改写授权时间与历史能力判定。
+        """
+        conflict = self.consent_conflicts.get(consent_id)
+        if conflict is None:
+            raise NotFound(f"同意编号 {consent_id} 无待裁定冲突")
+        if conflict["status"] != CONFLICT_PENDING:
+            raise SandboxError(f"冲突已裁定：{conflict['status']}，不能重复裁定")
+        if decision not in ("uphold", "correct"):
+            raise SandboxError("裁定只能是 uphold（维持首次）或 correct（追加更正）")
+
+        chosen = conflict["attempts"][-1]["binding"]
+        resolution = {
+            "officer_id": officer_id,
+            "at": now.isoformat(),
+            "decision": decision,
+            "chosen_binding_fingerprint": (
+                conflict["attempts"][-1]["binding_fingerprint"]
+                if decision == "correct"
+                else conflict["first_binding_fingerprint"]),
+            "note": note,
+        }
+        conflict["status"] = (CONFLICT_UPHELD if decision == "uphold"
+                              else CONFLICT_CORRECTED)
+        conflict["resolution"] = resolution
+        self.audit.append({
+            "at": now.isoformat(),
+            "action": "同意冲突裁定", "consent_id": consent_id,
+            "decision": decision, "officer_id": officer_id, "note": note,
+        })
+        if decision == "correct":
+            self._append_correction(
+                consent_id, chosen["case_id"], chosen["course_id"],
+                now, chosen["scope_note"], chosen["content_summary"],
+                effective_at=now, source="conflict-resolution",
+                officer_id=officer_id, note=note)
+        return conflict
+
+    def append_consent_correction(self, consent_id: str, case_id: str,
+                                  course_id: Optional[str], authorized_at: datetime,
+                                  scope_note: str, content_summary: str,
+                                  now: datetime, *, note: str = "") -> dict:
+        """授权人员追加更正记录。旧记录保持原样，更正自指定时刻起生效。"""
+        if consent_id not in self.consents:
+            raise NotFound(f"未知同意记录：{consent_id}")
+        return self._append_correction(
+            consent_id, case_id, course_id, authorized_at, scope_note,
+            content_summary, effective_at=now, source="officer-amendment",
+            note=note)
+
+    def _append_correction(self, consent_id: str, case_id: str,
+                           course_id: Optional[str], authorized_at: datetime,
+                           scope_note: str, content_summary: str,
+                           *, effective_at: datetime, source: str,
+                           officer_id: Optional[str] = None,
+                           note: str = "") -> dict:
+        if case_id not in self.cases:
+            raise NotFound(f"未知病例：{case_id}")
+        if course_id is not None and course_id not in self.courses:
+            raise NotFound(f"未知课程：{course_id}")
+        binding, fp = self._consent_fingerprint(
+            case_id, course_id, authorized_at, scope_note, content_summary)
+        self._correction_seq += 1
+        record = {
+            "id": f"CORR-{self._correction_seq:04d}",
+            "consent_id": consent_id,
+            "binding": binding,
+            "binding_fingerprint": fp,
+            "case_id": case_id,
+            "course_id": course_id,
+            "authorized_at": authorized_at.isoformat() if authorized_at else None,
+            "effective_at": effective_at.isoformat(),
+            "source": source,
+            "officer_id": officer_id,
+            "note": note,
+        }
+        self.consent_corrections.append(record)
+        self.audit.append({
+            "at": effective_at.isoformat(), "action": "同意更正追加",
+            "consent_id": consent_id, "correction_id": record["id"],
+            "binding_fingerprint": fp, "source": source,
+            "effective_at": record["effective_at"],
+        })
+        return record
+
+    def _load_correction(self, data: dict) -> None:
+        """从序列化状态恢复更正记录，保持编号与时间不变。"""
+        record = {
+            "id": data["id"],
+            "consent_id": data["consent_id"],
+            "binding": data["binding"],
+            "binding_fingerprint": data["binding_fingerprint"],
+            "case_id": data["case_id"],
+            "course_id": data["course_id"],
+            "authorized_at": data.get("authorized_at"),
+            "effective_at": data["effective_at"],
+            "source": data.get("source", "officer-amendment"),
+            "officer_id": data.get("officer_id"),
+            "note": data.get("note", ""),
+        }
+        self.consent_corrections.append(record)
+        suffix = int(record["id"].rsplit("-", 1)[1])
+        self._correction_seq = max(self._correction_seq, suffix)
+
+    def _corrections_for(self, consent_id: str, now: datetime) -> list[dict]:
+        return [c for c in self.consent_corrections
+                if c["consent_id"] == consent_id
+                and parse_time(c["effective_at"]) <= now]
+
+    def _effective_bindings(self, grant: dict, now: datetime) -> list[dict]:
+        """一份同意在 ``now`` 时点承认的全部绑定：首次事实 + 已生效更正。"""
+        candidates = [{
+            "case_id": grant["case_id"],
+            "course_id": grant["course_id"],
+            "granted_at": grant["granted_at"],
+            "withdrawn_at": grant["withdrawn_at"],
+            "via": "首次落账",
+        }]
+        for correction in self._corrections_for(grant["id"], now):
+            candidates.append({
+                "case_id": correction["case_id"],
+                "course_id": correction["course_id"],
+                "granted_at": parse_time(correction["authorized_at"])
+                if correction["authorized_at"] else None,
+                "withdrawn_at": grant["withdrawn_at"],
+                "via": f"更正 {correction['id']}",
+            })
+        return candidates
+
+    def _grant_covers(self, grant: dict, case_id: str, course_id: str,
+                      now: datetime) -> bool:
+        """按已提交事实判定一份同意（含追加更正）是否覆盖病例+课程。
+
+        冲突未裁定前，后到内容既不改变首次事实、也不产生覆盖；更正只在其
+        生效时刻之后按新绑定覆盖，绝不回溯。
+        """
+        for cand in self._effective_bindings(grant, now):
+            if cand["case_id"] != case_id:
+                continue
+            if cand["course_id"] is not None and cand["course_id"] != course_id:
+                continue
+            if cand["granted_at"] is not None and cand["granted_at"] > now:
+                continue
+            if cand["withdrawn_at"] is not None and cand["withdrawn_at"] <= now:
+                continue
+            return True
+        return False
 
     def enroll(self, student_id: str, course_id: str,
                status: str = STATUS_PENDING) -> dict:
@@ -407,19 +743,13 @@ class Sandbox:
 
     def _active_consents(self, case_id: str, course_id: str,
                          now: datetime) -> list[dict]:
-        """返回当下覆盖该病例+课程且未撤回的同意。"""
-        active = []
-        for grant in self.consents.values():
-            if grant["case_id"] != case_id:
-                continue
-            if grant["course_id"] is not None and grant["course_id"] != course_id:
-                continue
-            if grant["granted_at"] > now:
-                continue
-            if grant["withdrawn_at"] is not None and grant["withdrawn_at"] <= now:
-                continue
-            active.append(grant)
-        return active
+        """返回当下覆盖该病例+课程且未撤回的同意。
+
+        只承认已提交事实：首次落账记录与其已生效更正；待裁定冲突中的后到
+        内容不参与判定（见 :meth:`grant_consent` 与 :meth:`_grant_covers`）。
+        """
+        return [grant for grant in self.consents.values()
+                if self._grant_covers(grant, case_id, course_id, now)]
 
     def _course_open(self, course_id: str, now: datetime) -> bool:
         course = self.courses[course_id]
@@ -677,13 +1007,16 @@ class Sandbox:
             raise NotFound(f"未知同意记录：{consent_id}")
         if grant["withdrawn_at"] is not None:
             raise SandboxError("同意已撤回，不能重复撤回")
+        # 撤回效力按撤回前已提交事实（首次绑定 + 已生效更正）确定影响面
+        covered_task_ids = {
+            task["id"] for task in self.tasks.values()
+            if self._grant_covers(grant, task["case_id"], task["course_id"], now)
+        }
         grant["withdrawn_at"] = now
 
         affected: list[dict] = []
         for task in self.tasks.values():
-            if task["case_id"] != grant["case_id"]:
-                continue
-            if grant["course_id"] is not None and task["course_id"] != grant["course_id"]:
+            if task["id"] not in covered_task_ids:
                 continue
             # 撤回该病例相关的进行中会话
             for session in self.sessions.values():
@@ -802,9 +1135,13 @@ class Sandbox:
 
         consent_view = []
         for grant in self.consents.values():
-            if grant["case_id"] != task["case_id"]:
-                continue
-            if grant["course_id"] is not None and grant["course_id"] != task["course_id"]:
+            # 展示首次事实与所有已追加更正中覆盖本病例/本课程的绑定，
+            # 待裁定冲突的后到内容不进入授权视图
+            bindings = [b for b in self._effective_bindings(grant, datetime.max)
+                        if b["case_id"] == task["case_id"]
+                        and (b["course_id"] is None
+                             or b["course_id"] == task["course_id"])]
+            if not bindings:
                 continue
             consent_view.append({
                 "consent_id": grant["id"],
@@ -812,6 +1149,24 @@ class Sandbox:
                 "withdrawn_at": grant["withdrawn_at"].isoformat()
                 if grant["withdrawn_at"] else None,
                 "scope": "课程专用" if grant["course_id"] else "教学通用",
+                "source": grant.get("source", "import"),
+                "first_import_batch": grant.get("first_import_batch"),
+                "binding_fingerprint": grant["binding_fingerprint"],
+                "replays": list(grant.get("replays", [])),
+                "corrections": [
+                    {
+                        "correction_id": c["id"],
+                        "case_id": c["case_id"],
+                        "course_id": c["course_id"],
+                        "authorized_at": c["authorized_at"],
+                        "effective_at": c["effective_at"],
+                        "binding_fingerprint": c["binding_fingerprint"],
+                        "source": c["source"],
+                    }
+                    for c in self.consent_corrections
+                    if c["consent_id"] == grant["id"]
+                ],
+                "conflict": self._conflict_view(grant["id"]),
             })
         return {
             "assignment_id": assignment_id,
@@ -844,6 +1199,284 @@ class Sandbox:
             "风险标记": list(assignment["risk_flags"]),
             "fingerprint": assignment["fingerprint"],
         }
+
+    def _conflict_view(self, consent_id: str) -> Optional[dict]:
+        conflict = self.consent_conflicts.get(consent_id)
+        if conflict is None:
+            return None
+        return {
+            "status": conflict["status"],
+            "changed_fields": self._binding_diff(
+                conflict["first_binding"],
+                conflict["attempts"][-1]["binding"]) if conflict["attempts"] else [],
+            "attempt_count": len(conflict["attempts"]),
+            "resolution": conflict["resolution"],
+        }
+
+    def consent_report(self, consent_id: str) -> dict:
+        """按同意编号追溯：首次来源、重放、冲突及其对课程/会话/作业的影响。
+
+        用于事故复盘：解释编号绑定边界、后到内容是否获得能力（未裁定前不获得），
+        以及首次事实与冲突分别影响哪些课程、进行中会话与已评分作业。
+        """
+        grant = self.consents.get(consent_id)
+        if grant is None:
+            raise NotFound(f"未知同意记录：{consent_id}")
+
+        bindings = self._effective_bindings(grant, datetime.max)
+        covered_cases = sorted({b["case_id"] for b in bindings})
+
+        def binding_matches(case_id: str, course_id: str) -> bool:
+            return any(b["case_id"] == case_id
+                       and (b["course_id"] is None or b["course_id"] == course_id)
+                       for b in bindings)
+
+        covered_courses: set[str] = set()
+        sessions, graded, open_assignments = [], [], []
+        for task in self.tasks.values():
+            if not binding_matches(task["case_id"], task["course_id"]):
+                continue
+            covered_courses.add(task["course_id"])
+            for session in self.sessions.values():
+                if session["task_id"] != task["id"]:
+                    continue
+                sessions.append({
+                    "slice_id": session["id"], "course_id": task["course_id"],
+                    "case_id": task["case_id"], "student_id": session["student_id"],
+                    "status": session["status"],
+                    "revoke_reason": session.get("revoke_reason"),
+                })
+            for assignment in self.assignments.values():
+                if assignment["task_id"] != task["id"]:
+                    continue
+                row = {
+                    "assignment_id": assignment["id"],
+                    "course_id": task["course_id"],
+                    "student_id": assignment["student_id"],
+                    "status": assignment["status"],
+                    "risk_flags": assignment["risk_flags"],
+                }
+                (graded if assignment["status"] == STATUS_GRADED
+                 else open_assignments).append(row)
+
+        conflict = self.consent_conflicts.get(consent_id)
+        incoming_impact: list[str] = []
+        if conflict is not None and conflict["status"] == CONFLICT_PENDING:
+            # 后到内容未获能力：说明它本会扩到哪些课程/病例
+            for attempt in conflict["attempts"]:
+                b = attempt["binding"]
+                incoming_impact.append(
+                    f"待裁定后到内容（{','.join(self._binding_diff(conflict['first_binding'], b))}"
+                    f"）未获得能力：病例 {b['case_id']} / "
+                    f"{'教学通用' if b['course_id'] is None else b['course_id']}")
+
+        return {
+            "consent_id": consent_id,
+            "首次来源": {
+                "source": grant.get("source", "import"),
+                "import_batch": grant.get("first_import_batch"),
+                "imported_at": self._iso(grant.get("first_imported_at")),
+                "binding": grant["binding"],
+                "binding_fingerprint": grant["binding_fingerprint"],
+                "withdrawn_at": self._iso(grant["withdrawn_at"]),
+            },
+            "重放": list(grant.get("replays", [])),
+            "更正": [
+                {
+                    "correction_id": c["id"], "binding": c["binding"],
+                    "authorized_at": c["authorized_at"],
+                    "effective_at": c["effective_at"], "source": c["source"],
+                    "officer_id": c["officer_id"], "note": c["note"],
+                } for c in self.consent_corrections
+                if c["consent_id"] == consent_id
+            ],
+            "冲突": ({
+                "status": conflict["status"],
+                "first_binding": conflict["first_binding"],
+                "attempts": conflict["attempts"],
+                "resolution": conflict["resolution"],
+                "后到内容能力": incoming_impact,
+            } if conflict is not None else None),
+            "影响面": {
+                "covered_cases": covered_cases,
+                "covered_courses": sorted(covered_courses),
+                "sessions": sessions,
+                "graded_assignments": graded,
+                "open_assignments": open_assignments,
+            },
+        }
+
+    # ---- 序列化与恢复 ---------------------------------------------------
+
+    @staticmethod
+    def _iso(value: Optional[datetime]) -> Optional[str]:
+        return value.isoformat() if isinstance(value, datetime) else value
+
+    def _dump_consent(self, grant: dict) -> dict:
+        return {
+            "id": grant["id"],
+            "case_id": grant["case_id"],
+            "course_id": grant["course_id"],
+            "granted_at": self._iso(grant["granted_at"]),
+            "withdrawn_at": self._iso(grant["withdrawn_at"]),
+            "scope_note": grant.get("scope_note", ""),
+            "content_summary": grant.get("content_summary", ""),
+            "binding": grant.get("binding"),
+            "binding_fingerprint": grant.get("binding_fingerprint"),
+            "source": grant.get("source", "import"),
+            "first_import_batch": grant.get("first_import_batch"),
+            "first_imported_at": self._iso(grant.get("first_imported_at")),
+            "replays": grant.get("replays", []),
+        }
+
+    def to_state(self) -> dict:
+        """导出可 JSON 序列化的完整账本状态（含冲突、更正与审计）。"""
+        return {
+            "format_version": 2,
+            "actors": list(self.actors.values()),
+            "courses": [{
+                **c,
+                "starts_at": self._iso(c["starts_at"]),
+                "ends_at": self._iso(c["ends_at"]),
+            } for c in self.courses.values()],
+            "cases": list(self.cases.values()),
+            "policies": list(self.policies.values()),
+            "environments": [{
+                "id": eid, "version": ver, **{
+                    k: (self._iso(v) if k == "released_at" else v)
+                    for k, v in rec.items() if k not in ("id", "version")},
+            } for (eid, ver), rec in self.environment_versions.items()],
+            "snapshots": [{
+                **{k: v for k, v in rec.items()},
+                "released_at": self._iso(rec["released_at"]),
+            } for (_, _ver), rec in self.snapshots.items()],
+            "consents": [self._dump_consent(g) for g in self.consents.values()],
+            "consent_conflicts": list(self.consent_conflicts.values()),
+            "consent_corrections": list(self.consent_corrections),
+            "enrollments": list(self.enrollments),
+            "teachers": list(self.teacher_courses),
+            "tasks": [{**t, "created_at": self._iso(t["created_at"])}
+                      for t in self.tasks.values()],
+            "assignments": [{
+                **a,
+                "submitted_at": self._iso(a["submitted_at"]),
+                "graded_at": self._iso(a["graded_at"]),
+            } for a in self.assignments.values()],
+            "sessions": [{
+                **s,
+                "issued_at": self._iso(s["issued_at"]),
+                "expires_at": self._iso(s["expires_at"]),
+            } for s in self.sessions.values()],
+            "exports": [{
+                **e,
+                "requested_at": self._iso(e["requested_at"]),
+                "decided_at": self._iso(e["decided_at"]),
+            } for e in self.exports.values()],
+            "audit": list(self.audit),
+            "seq": self._seq,
+            "correction_seq": self._correction_seq,
+        }
+
+    def dump_state(self, path: str | Path) -> None:
+        Path(path).write_text(
+            json.dumps(self.to_state(), ensure_ascii=False, indent=2),
+            encoding="utf-8")
+
+    @classmethod
+    def from_state(cls, state: dict) -> "Sandbox":
+        """从 :meth:`to_state` 的产物恢复；兼容缺少绑定字段的旧版转储。"""
+        box = cls()
+        for actor in state.get("actors", []):
+            box.actors[actor["id"]] = dict(actor)
+        for course in state.get("courses", []):
+            box.courses[course["id"]] = {
+                **course,
+                "starts_at": parse_time(course["starts_at"]),
+                "ends_at": parse_time(course["ends_at"]),
+            }
+        for case in state.get("cases", []):
+            box.cases[case["id"]] = dict(case)
+        for policy in state.get("policies", []):
+            box.policies[policy["id"]] = dict(policy)
+        for env in state.get("environments", []):
+            rec = dict(env)
+            eid, ver = rec["id"], rec["version"]
+            rec["released_at"] = parse_time(rec["released_at"])
+            box.environment_versions[(eid, ver)] = rec
+        for snap in state.get("snapshots", []):
+            rec = dict(snap)
+            key = (rec["case_id"], rec["version"])
+            rec["released_at"] = parse_time(rec["released_at"])
+            box.snapshots[key] = rec
+        for data in state.get("consents", []):
+            box._restore_consent(data)
+        for correction in state.get("consent_corrections", []):
+            box._load_correction(correction)
+        for conflict in state.get("consent_conflicts", []):
+            box._load_conflict(conflict)
+        for enrollment in state.get("enrollments", []):
+            box.enrollments.append(dict(enrollment))
+        for link in state.get("teachers", []):
+            box.teacher_courses.append(dict(link))
+        for data in state.get("tasks", []):
+            task = dict(data)
+            task["created_at"] = parse_time(task["created_at"])
+            box.tasks[task["id"]] = task
+        for data in state.get("assignments", []):
+            record = dict(data)
+            record["submitted_at"] = parse_time(record["submitted_at"])
+            if record.get("graded_at"):
+                record["graded_at"] = parse_time(record["graded_at"])
+            box.assignments[record["id"]] = record
+        for data in state.get("sessions", []):
+            session = dict(data)
+            session["issued_at"] = parse_time(session["issued_at"])
+            session["expires_at"] = parse_time(session["expires_at"])
+            box.sessions[session["id"]] = session
+        for data in state.get("exports", []):
+            export = dict(data)
+            export["requested_at"] = parse_time(export["requested_at"])
+            if export.get("decided_at"):
+                export["decided_at"] = parse_time(export["decided_at"])
+            box.exports[export["id"]] = export
+        box.audit.extend(state.get("audit", []))
+        box._seq = state.get("seq", 0)
+        box._correction_seq = state.get("correction_seq", 0)
+        return box
+
+    def _restore_consent(self, data: dict) -> None:
+        """恢复一份同意；旧版转储缺少绑定时按记录字段补齐（只读兼容）。"""
+        granted_at = parse_time(data["granted_at"]) if data.get("granted_at") else None
+        binding = data.get("binding")
+        if binding is None:
+            binding = self._consent_binding(
+                data["case_id"], data.get("course_id"),
+                granted_at, data.get("scope_note", ""),
+                data.get("content_summary", ""))
+        fp = data.get("binding_fingerprint") or self._binding_fingerprint(binding)
+        first_imported_at = data.get("first_imported_at")
+        grant = {
+            "id": data["id"],
+            "case_id": data["case_id"],
+            "course_id": data.get("course_id"),
+            "granted_at": granted_at,
+            "withdrawn_at": parse_time(data["withdrawn_at"])
+            if data.get("withdrawn_at") else None,
+            "scope_note": data.get("scope_note", ""),
+            "content_summary": data.get("content_summary", ""),
+            "binding": binding,
+            "binding_fingerprint": fp,
+            "source": data.get("source", "import"),
+            "first_import_batch": data.get("first_import_batch"),
+            "first_imported_at": parse_time(first_imported_at)
+            if first_imported_at else None,
+            "replays": data.get("replays", []),
+        }
+        self.consents[grant["id"]] = grant
+
+    @classmethod
+    def load_state(cls, path: str | Path) -> "Sandbox":
+        return cls.from_state(json.loads(Path(path).read_text(encoding="utf-8")))
 
     # ---- 查询 -----------------------------------------------------------
 

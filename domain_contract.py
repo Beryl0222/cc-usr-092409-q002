@@ -24,6 +24,36 @@ SEED = "fixtures/seed.json"
 T = lambda s: datetime.fromisoformat(s)  # noqa: E731
 
 
+def build_boundary_box():
+    """构造两门课、两个病例的最小沙箱，用于同意编号边界测试。"""
+    box = Sandbox()
+    box.add_course("C-A", "甲课程", T("2026-01-01T00:00:00"),
+                   T("2026-12-31T00:00:00"))
+    box.add_course("C-B", "乙课程", T("2026-01-01T00:00:00"),
+                   T("2026-04-30T00:00:00"))
+    box.add_case("CASE-X", "病例 X", courses=["C-A", "C-B"])
+    box.add_case("CASE-Y", "病例 Y", courses=["C-B"])
+    box.policies["P1"] = {"id": "P1", "version": 1, "k_threshold": 1,
+                          "transforms": {}}
+    box.add_environment("ENV", 1, {"python": "3.11.9"},
+                        T("2026-01-01T00:00:00"))
+    rows = [{"patient_id": "P-1", "v": 1}, {"patient_id": "P-2", "v": 2}]
+    box.add_snapshot("CASE-X", 1, rows, ["patient_id"],
+                     T("2026-01-02T00:00:00"))
+    box.add_snapshot("CASE-Y", 1, rows, ["patient_id"],
+                     T("2026-01-02T00:00:00"))
+    box.enroll("S1", "C-A", STATUS_SANDBOX)
+    box.enroll("S2", "C-B", STATUS_SANDBOX)
+    box.assign_teacher("T1", "C-A")
+    box.create_task("TASK-A", "C-A", "CASE-X", ["v"], "P1", "ENV",
+                    T("2026-02-01T00:00:00"))
+    box.create_task("TASK-B", "C-B", "CASE-X", ["v"], "P1", "ENV",
+                    T("2026-02-01T00:00:00"))
+    box.create_task("TASK-BY", "C-B", "CASE-Y", ["v"], "P1", "ENV",
+                    T("2026-02-01T00:00:00"))
+    return box
+
+
 class SeedTest(unittest.TestCase):
     def setUp(self):
         self.box = Sandbox.from_seed(SEED)
@@ -343,6 +373,368 @@ class TraceTest(unittest.TestCase):
                          {"AS-LIN-01", "AS-WANG-01", "AS-GAO-01"})
         self.assertEqual({row["course_id"] for row in listing},
                          {"C-LOCAL", "C-CROSS"})
+
+
+class ConsentBoundaryTest(unittest.TestCase):
+    """同意编号首次落账后的标识边界：重放幂等、换字段即冲突且不覆盖。"""
+
+    GRANTED = T("2026-01-10T00:00:00")
+    NOW = T("2026-02-10T00:00:00")
+
+    def setUp(self):
+        self.box = build_boundary_box()
+
+    def test_first_landing_binds_four_key_fields(self):
+        grant = self.box.grant_consent(
+            "CONS-X", "CASE-X", "C-A", self.GRANTED,
+            "仅甲课程脱敏教学", "sha256:abcd",
+            source="batch-import", import_batch="B001",
+            imported_at=T("2026-01-11T08:00:00"))
+        self.assertEqual(grant["binding"]["case_id"], "CASE-X")
+        self.assertEqual(grant["binding"]["course_id"], "C-A")
+        self.assertEqual(grant["binding"]["granted_at"], "2026-01-10T00:00:00")
+        self.assertEqual(grant["binding"]["content_summary"], "sha256:abcd")
+        self.assertEqual(len(grant["binding_fingerprint"]), 16)
+        self.assertEqual(grant["source"], "batch-import")
+        # 首次落账写审计
+        self.assertTrue(any(a["action"] == "同意首次落账"
+                            and a["consent_id"] == "CONS-X"
+                            for a in self.box.audit))
+
+    def test_same_id_reused_across_cases_keeps_first_and_conflicts(self):
+        # 事故复现：两个病例包误用同一同意编号
+        first = self.box.grant_consent(
+            "CONS-DUP", "CASE-X", "C-A", self.GRANTED, "甲课程用", "sum-x")
+        second = self.box.grant_consent(
+            "CONS-DUP", "CASE-Y", "C-B", self.GRANTED, "乙课程用", "sum-y")
+        # 返回的仍是首次记录，首次事实四要素原样保留
+        self.assertIs(second, first)
+        self.assertEqual(first["case_id"], "CASE-X")
+        self.assertEqual(first["course_id"], "C-A")
+        self.assertEqual(first["content_summary"], "sum-x")
+        # 冲突账登记，后到内容未裁定前不获得能力
+        conflict = self.box.consent_conflicts["CONS-DUP"]
+        self.assertEqual(conflict["status"], "待裁定")
+        self.assertIn("病例", self.box.audit[-1]["changed_fields"])
+        # 甲课程（首次）继续有同意；乙课程的病例 Y 不被后到内容授权
+        self.assertTrue(self.box._active_consents("CASE-X", "C-A", self.NOW))
+        self.assertFalse(self.box._active_consents("CASE-Y", "C-B", self.NOW))
+        with self.assertRaises(AuthorizationError):
+            self.box.issue_slice("S2", "TASK-BY", self.NOW)
+        # 首次课程的切片照常签发——首门课程不再被静默夺走授权
+        session = self.box.issue_slice("S1", "TASK-A", self.NOW)
+        self.assertEqual(session["status"], STATUS_SANDBOX)
+
+    def test_same_case_changed_scope_conflicts_without_capability(self):
+        self.box.grant_consent(
+            "CONS-S", "CASE-X", "C-A", self.GRANTED, "仅甲课程", "sum-1")
+        # 同病例、把范围从 C-A 改成通用（None）
+        self.box.grant_consent(
+            "CONS-S", "CASE-X", None, self.GRANTED, "全部教学用途", "sum-1")
+        conflict = self.box.consent_conflicts["CONS-S"]
+        self.assertEqual(conflict["status"], "待裁定")
+        self.assertEqual(
+            self.box._binding_diff(conflict["first_binding"],
+                                   conflict["attempts"][-1]["binding"]),
+            ["课程范围", "范围说明"])
+        # 首次范围 C-A 有效；乙课程不能借后到内容获得覆盖
+        self.assertTrue(self.box._active_consents("CASE-X", "C-A", self.NOW))
+        self.assertFalse(self.box._active_consents("CASE-X", "C-B", self.NOW))
+
+    def test_changed_time_or_summary_conflicts(self):
+        self.box.grant_consent(
+            "CONS-T", "CASE-X", "C-A", self.GRANTED, "说明", "sum-1")
+        self.box.grant_consent(
+            "CONS-T", "CASE-X", "C-A", T("2026-01-20T00:00:00"), "说明", "sum-1")
+        self.assertEqual(
+            self.box.consent_conflicts["CONS-T"]["attempts"][-1]
+            ["binding"]["granted_at"], "2026-01-20T00:00:00")
+        self.box.grant_consent(
+            "CONS-T", "CASE-X", "C-A", self.GRANTED, "说明", "sum-2")
+        self.assertEqual(len(self.box.consent_conflicts["CONS-T"]["attempts"]), 2)
+        # 授权时间仍是首次时间
+        self.assertEqual(self.box.consents["CONS-T"]["granted_at"], self.GRANTED)
+
+    def test_exact_replay_returns_original_without_new_grant(self):
+        first = self.box.grant_consent(
+            "CONS-R", "CASE-X", "C-A", self.GRANTED, "说明", "sum-r",
+            import_batch="B1")
+        again = self.box.grant_consent(
+            "CONS-R", "CASE-X", "C-A", self.GRANTED, "说明", "sum-r",
+            import_batch="B2")
+        self.assertIs(again, first)
+        self.assertEqual(len(self.box.consents), 1)
+        self.assertEqual(len(first["replays"]), 1)
+        self.assertEqual(first["replays"][0]["import_batch"], "B2")
+        # 同批次重放（恢复后重导）不重复登记
+        self.box.grant_consent(
+            "CONS-R", "CASE-X", "C-A", self.GRANTED, "说明", "sum-r",
+            import_batch="B2")
+        self.assertEqual(len(first["replays"]), 1)
+        self.assertTrue(any(a["action"] == "同意重复导入重放"
+                            for a in self.box.audit))
+
+    def test_conflict_does_not_overwrite_risk_flags_or_audit(self):
+        # 首次授权下产生已评分作业并因撤回打上风险标记
+        self.box.grant_consent("CONS-K", "CASE-X", "C-A", self.GRANTED, "s", "k")
+        session = self.box.issue_slice("S1", "TASK-A", self.NOW)
+        self.box.submit_assignment(
+            "AS-1", "S1", "TASK-A", "结论", [{"step": "a", "tool": "python"}],
+            self.NOW, slice_ids=[session["id"]])
+        self.box.grade_assignment("T1", "AS-1", "A", "通过", self.NOW)
+        audit_before = len(self.box.audit)
+        # 后到的跨病例导入：不得改写授权、风险标记或既有审计
+        self.box.grant_consent(
+            "CONS-K", "CASE-Y", "C-B", self.GRANTED, "s", "k2")
+        self.box.withdraw_consent("CONS-K", T("2026-03-01T00:00:00"))
+        flags = {f["type"] for f in self.box.assignments["AS-1"]["risk_flags"]}
+        self.assertIn("同意撤回", flags)
+        # 撤回审计仅新增，不被覆盖
+        self.assertGreater(len(self.box.audit), audit_before)
+
+
+class ConsentRaceTest(unittest.TestCase):
+    """撤回、课程到期、签发与导出按已提交事实的时间边界判定。"""
+
+    def setUp(self):
+        self.box = build_boundary_box()
+        self.granted = T("2026-01-10T00:00:00")
+        self.box.grant_consent(
+            "CONS-W", "CASE-X", None, self.granted, "教学通用", "sum-w")
+        self.t0 = T("2026-02-10T09:00:00")
+
+    def test_slice_and_export_decide_on_committed_fact_at_instant(self):
+        session = self.box.issue_slice("S1", "TASK-A", self.t0)
+        # 与撤回同一时刻到达的导出：撤回事实已提交即阻断（边界 <=）
+        withdraw_at = T("2026-02-10T10:00:00")
+        record = self.box.request_export(
+            "EXP-E", "S1", session["id"],
+            [{"key": "g", "count": 2}], ["v"], withdraw_at)
+        self.assertEqual(record["decision"], EXPORT_APPROVED)
+        self.box.withdraw_consent("CONS-W", withdraw_at)
+        self.assertEqual(session["status"], STATUS_REVOKED)
+        # 撤回后同刻再签发/导出都按“无有效同意”处理
+        with self.assertRaises(AuthorizationError):
+            self.box.issue_slice("S2", "TASK-B", withdraw_at)
+        after = self.box.request_export(
+            "EXP-L", "S1", session["id"],
+            [{"key": "g", "count": 2}], ["v"], withdraw_at)
+        self.assertEqual(after["decision"], EXPORT_BLOCKED)
+        self.assertTrue(any("撤回" in r for r in after["reasons"]))
+
+    def test_conflicting_import_cannot_resurrect_withdrawn_consent(self):
+        # 撤回与一个“修正版”导入并发：未裁定的后到内容不能让同意复活
+        self.box.withdraw_consent("CONS-W", self.t0)
+        self.box.grant_consent(
+            "CONS-W", "CASE-X", None, self.granted, "教学通用（新版）", "sum-w2",
+            imported_at=self.t0)
+        self.assertEqual(self.box.consents["CONS-W"]["withdrawn_at"], self.t0)
+        self.assertEqual(
+            self.box.consent_conflicts["CONS-W"]["status"], "待裁定")
+        with self.assertRaises(AuthorizationError):
+            self.box.issue_slice("S1", "TASK-A", self.t0)
+
+    def test_course_expiry_and_consent_both_gate_independently(self):
+        # 乙课程 4 月底到期；到期时同意仍在也收权
+        expired = T("2026-05-01T00:00:00")
+        self.box.sweep_expired(expired)
+        self.assertEqual(
+            self.box._enrollment("S2", "C-B")["status"], STATUS_REVOKED)
+        with self.assertRaises(AuthorizationError):
+            self.box.issue_slice("S2", "TASK-B", expired)
+        # 甲课程未到期且同意有效，不受影响
+        self.assertEqual(
+            self.box.issue_slice("S1", "TASK-A", expired)["status"],
+            STATUS_SANDBOX)
+
+
+class ConsentCorrectionTest(unittest.TestCase):
+    """授权人员可追加更正，但旧记录不可改写；裁定让后到内容前向生效。"""
+
+    GRANTED = T("2026-01-10T00:00:00")
+
+    def setUp(self):
+        self.box = build_boundary_box()
+        self.first = self.box.grant_consent(
+            "CONS-C", "CASE-X", "C-A", self.GRANTED, "仅甲课程", "sum-a")
+
+    def test_officer_correction_is_append_only_and_forward_effective(self):
+        before = T("2026-02-01T00:00:00")
+        effective = T("2026-03-01T00:00:00")
+        # 更正生效前，乙课程无覆盖
+        self.assertFalse(self.box._active_consents("CASE-X", "C-B", before))
+        corr = self.box.append_consent_correction(
+            "CONS-C", "CASE-X", None, self.GRANTED, "扩为教学通用", "sum-b",
+            effective, note="管理员补登记跨课程授权")
+        self.assertTrue(corr["id"].startswith("CORR-"))
+        # 旧记录字段原样保留
+        self.assertEqual(self.first["course_id"], "C-A")
+        self.assertEqual(self.first["scope_note"], "仅甲课程")
+        self.assertEqual(self.first["content_summary"], "sum-a")
+        # 更正只向前生效，不回溯
+        self.assertFalse(self.box._active_consents("CASE-X", "C-B", before))
+        self.assertTrue(self.box._active_consents("CASE-X", "C-B", effective))
+
+    def test_uphold_resolution_keeps_first_fact(self):
+        self.box.grant_consent(
+            "CONS-C", "CASE-X", "C-B", self.GRANTED, "乙课程", "sum-b")
+        conflict = self.box.resolve_consent_conflict(
+            "CONS-C", "OFFICER-1", "uphold", T("2026-02-05T00:00:00"),
+            note="编号误用，维持首次授权")
+        self.assertEqual(conflict["status"], "维持首次授权")
+        self.assertFalse(self.box._active_consents(
+            "CASE-X", "C-B", T("2026-02-06T00:00:00")))
+        with self.assertRaises(SandboxError):
+            self.box.resolve_consent_conflict(
+                "CONS-C", "OFFICER-1", "uphold", T("2026-02-06T00:00:00"))
+
+    def test_correct_resolution_appends_correction_without_rewrite(self):
+        self.box.grant_consent(
+            "CONS-C", "CASE-X", None, self.GRANTED, "教学通用", "sum-b")
+        decide_at = T("2026-02-05T00:00:00")
+        conflict = self.box.resolve_consent_conflict(
+            "CONS-C", "OFFICER-1", "correct", decide_at, note="确认跨课程")
+        self.assertEqual(conflict["status"], "已更正")
+        # 裁定时刻之前乙课程无覆盖（不回溯）；之后有覆盖
+        self.assertFalse(self.box._active_consents(
+            "CASE-X", "C-B", T("2026-02-04T00:00:00")))
+        self.assertTrue(self.box._active_consents("CASE-X", "C-B", decide_at))
+        # 首次事实仍未被改写
+        self.assertEqual(self.first["course_id"], "C-A")
+        correction = self.box.consent_corrections[-1]
+        self.assertEqual(correction["source"], "conflict-resolution")
+        self.assertEqual(correction["officer_id"], "OFFICER-1")
+
+
+class ConsentRecoveryTest(unittest.TestCase):
+    """种子装载兼容、序列化恢复后继续保持编号边界。"""
+
+    GRANTED = T("2026-01-10T00:00:00")
+
+    def test_legacy_seed_loads_without_content_summary(self):
+        box = Sandbox.from_seed(SEED)
+        grant = box.consents["CONS-AML-TEACH"]
+        self.assertEqual(grant["content_summary"], "")
+        self.assertEqual(len(grant["binding_fingerprint"]), 16)
+        # 旧数据仍覆盖两门课程
+        now = T("2026-04-01T09:00:00")
+        self.assertTrue(box._active_consents("CASE-AML", "C-LOCAL", now))
+        self.assertTrue(box._active_consents("CASE-AML", "C-CROSS", now))
+
+    def test_roundtrip_preserves_conflicts_replays_and_corrections(self):
+        box = build_boundary_box()
+        box.grant_consent("CONS-V", "CASE-X", "C-A", self.GRANTED, "s", "sum-1",
+                          import_batch="B1")
+        box.grant_consent("CONS-V", "CASE-X", "C-A", self.GRANTED, "s", "sum-1",
+                          import_batch="B2")  # 重放
+        box.grant_consent("CONS-V", "CASE-Y", "C-B", self.GRANTED, "s", "sum-2")
+        box.append_consent_correction(
+            "CONS-V", "CASE-X", None, self.GRANTED, "通用", "sum-3",
+            T("2026-03-01T00:00:00"))
+
+        restored = Sandbox.from_state(box.to_state())
+        grant = restored.consents["CONS-V"]
+        self.assertEqual(grant["case_id"], "CASE-X")
+        self.assertEqual(len(grant["replays"]), 1)
+        self.assertEqual(restored.consent_conflicts["CONS-V"]["status"],
+                         "待裁定")
+        self.assertEqual(len(restored.consent_corrections), 1)
+        self.assertTrue(restored._active_consents(
+            "CASE-X", "C-B", T("2026-03-02T00:00:00")))
+        self.assertFalse(restored._active_consents(
+            "CASE-Y", "C-B", T("2026-03-02T00:00:00")))
+
+    def test_reimport_after_recovery_keeps_boundary(self):
+        box = build_boundary_box()
+        box.grant_consent("CONS-V", "CASE-X", "C-A", self.GRANTED, "s", "sum-1",
+                          import_batch="B1")
+        restored = Sandbox.from_state(box.to_state())
+        # 恢复后完全重放：返回原记录、不再落新账
+        replay = restored.grant_consent(
+            "CONS-V", "CASE-X", "C-A", self.GRANTED, "s", "sum-1",
+            import_batch="B3")
+        self.assertEqual(replay["binding_fingerprint"],
+                         box.consents["CONS-V"]["binding_fingerprint"])
+        self.assertEqual(len(restored.consents), 1)
+        # 恢复后换字段导入：仍是冲突，首次事实不动
+        restored.grant_consent(
+            "CONS-V", "CASE-Y", "C-B", self.GRANTED, "s", "sum-9")
+        self.assertEqual(restored.consents["CONS-V"]["case_id"], "CASE-X")
+        self.assertEqual(
+            restored.consent_conflicts["CONS-V"]["status"], "待裁定")
+
+    def test_legacy_state_without_binding_is_backfilled(self):
+        # 旧版转储没有 binding/content_summary：恢复时只读补齐
+        box = build_boundary_box()
+        box.grant_consent("CONS-OLD", "CASE-X", "C-A", self.GRANTED)
+        state = box.to_state()
+        state["consents"][-1].pop("binding")
+        state["consents"][-1].pop("binding_fingerprint")
+        restored = Sandbox.from_state(state)
+        grant = restored.consents["CONS-OLD"]
+        self.assertEqual(grant["binding"]["case_id"], "CASE-X")
+        self.assertEqual(len(grant["binding_fingerprint"]), 16)
+
+
+class ConsentTraceTest(unittest.TestCase):
+    """追溯结果解释首次来源、重放、冲突及其影响面。"""
+
+    GRANTED = T("2026-01-10T00:00:00")
+
+    def setUp(self):
+        self.box = Sandbox.from_seed(SEED)
+
+    def test_trace_explains_first_source_replay_and_conflict(self):
+        grant = self.box.grant_consent(
+            "CONS-AML-TEACH", "CASE-AML", None,
+            T("2026-02-25T00:00:00"),
+            "覆盖两门口径内教学课程，仅限脱敏切片在限时沙箱内使用，禁止再识别",
+            "", import_batch="REPLAY")
+        self.assertIs(grant, self.box.consents["CONS-AML-TEACH"])
+        # 换范围导入产生冲突
+        self.box.grant_consent(
+            "CONS-AML-TEACH", "CASE-T2D", "C-LOCAL",
+            T("2026-02-25T00:00:00"), "误挂到对照病例", "sum-x")
+        view = self.box.trace("AS-LIN-01")["课程授权"]["consents"][0]
+        self.assertEqual(view["source"], "seed")
+        self.assertTrue(any(r["import_batch"] == "REPLAY"
+                            for r in view["replays"]))
+        self.assertEqual(view["conflict"]["status"], "待裁定")
+        self.assertIn("病例", view["conflict"]["changed_fields"])
+        self.assertIn("课程范围", view["conflict"]["changed_fields"])
+
+    def test_consent_report_covers_courses_sessions_and_graded_work(self):
+        day_before = T("2026-05-04T09:00:00")
+        self.box.issue_slice("S-LIN", "TASK-LOCAL-Q1", day_before,
+                             ttl_minutes=2880)
+        cross_session = self.box.issue_slice(
+            "S-WANG", "TASK-CROSS-Q1", day_before, ttl_minutes=2880)
+        self.box.withdraw_consent("CONS-AML-TEACH", T("2026-05-05T12:00:00"))
+        report = self.box.consent_report("CONS-AML-TEACH")
+        self.assertEqual(report["首次来源"]["source"], "seed")
+        self.assertEqual(report["影响面"]["covered_cases"], ["CASE-AML"])
+        self.assertEqual(set(report["影响面"]["covered_courses"]),
+                         {"C-LOCAL", "C-CROSS"})
+        graded = {a["assignment_id"]
+                  for a in report["影响面"]["graded_assignments"]}
+        self.assertEqual(graded, {"AS-LIN-01", "AS-GAO-01"})
+        session_rows = report["影响面"]["sessions"]
+        self.assertIn(cross_session["id"],
+                      {s["slice_id"] for s in session_rows})
+        self.assertTrue(all(s["status"] == STATUS_REVOKED
+                            for s in session_rows))
+        graded_flags = report["影响面"]["graded_assignments"][0]["risk_flags"]
+        self.assertTrue(any(f["type"] == "同意撤回" for f in graded_flags))
+
+    def test_report_explains_pending_conflict_grants_no_capability(self):
+        self.box.grant_consent(
+            "CONS-AML-TEACH", "CASE-T2D", "C-LOCAL",
+            T("2026-02-25T00:00:00"), "试图挂到 T2D 病例", "sum-x")
+        report = self.box.consent_report("CONS-AML-TEACH")
+        self.assertEqual(report["冲突"]["status"], "待裁定")
+        self.assertTrue(any("CASE-T2D" in line
+                            for line in report["冲突"]["后到内容能力"]))
+        self.assertNotIn("CASE-T2D", report["影响面"]["covered_cases"])
 
 
 if __name__ == "__main__":
