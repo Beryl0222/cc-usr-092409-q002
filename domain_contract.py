@@ -3,25 +3,46 @@
 覆盖需求中的全部治理承诺：
 限时切片与脱敏、披露检查与小样本阻断、跨校到期收权、
 勘误/升级前向影响、同意撤回即时效力、已评分作业指纹冻结、
-教师复现与身份隔离、结论四要素溯源。
+教师复现与身份隔离、结论四要素溯源、
+同意编号的标识边界（绑定/重放/冲突/更正/竞态/恢复）。
 """
 
+import json
 import unittest
 from datetime import datetime
 
 from domain import (
+    CONFLICT_PENDING,
+    CONFLICT_RESOLVED,
+    CONSENT_CONFLICT,
+    CONSENT_REGISTERED,
+    CONSENT_REPLAYED,
     EXPORT_APPROVED,
     EXPORT_BLOCKED,
     STATUS_GRADED,
     STATUS_REVOKED,
     STATUS_SANDBOX,
     AuthorizationError,
+    NotFound,
     Sandbox,
     SandboxError,
 )
 
 SEED = "fixtures/seed.json"
 T = lambda s: datetime.fromisoformat(s)  # noqa: E731
+
+# 种子中 CONS-AML-TEACH 的首次落账内容（跨病例复用等场景以此为基准重放/改动）
+CONSENT_GRANTED = T("2026-02-25T00:00:00")
+CONSENT_NOTE = "覆盖两门口径内教学课程，仅限脱敏切片在限时沙箱内使用，禁止再识别"
+
+
+def reimport_consent(box, **overrides):
+    """以种子中的首次事实为基准重新导入同一编号，按需改动关键字段。"""
+    payload = {"consent_id": "CONS-AML-TEACH", "case_id": "CASE-AML",
+               "course_id": None, "granted_at": CONSENT_GRANTED,
+               "scope_note": CONSENT_NOTE}
+    payload.update(overrides)
+    return box.grant_consent(**payload)
 
 
 class SeedTest(unittest.TestCase):
@@ -343,6 +364,304 @@ class TraceTest(unittest.TestCase):
                          {"AS-LIN-01", "AS-WANG-01", "AS-GAO-01"})
         self.assertEqual({row["course_id"] for row in listing},
                          {"C-LOCAL", "C-CROSS"})
+
+
+class ConsentIdentityBoundaryTest(unittest.TestCase):
+    """同意编号的标识边界：首次落账绑定关键字段，重放幂等，冲突不覆盖。"""
+
+    def setUp(self):
+        self.box = Sandbox.from_seed(SEED)
+        self.now = T("2026-04-01T09:00:00")
+
+    def test_first_landing_binds_key_fields(self):
+        grant = self.box.consents["CONS-AML-TEACH"]
+        self.assertEqual(grant["case_id"], "CASE-AML")
+        self.assertIsNone(grant["course_id"])
+        self.assertEqual(grant["granted_at"], CONSENT_GRANTED)
+        self.assertEqual(grant["scope_note"], CONSENT_NOTE)
+        self.assertEqual(grant["source"], "种子装载")
+        self.assertEqual(len(grant["binding_hash"]), 16)
+
+    def test_new_consent_id_registers_normally(self):
+        result = self.box.grant_consent(
+            "CONS-T2D-LOCAL", "CASE-T2D", "C-LOCAL",
+            T("2026-03-01T00:00:00"), "仅限本校课程", now=self.now)
+        self.assertEqual(result["outcome"], CONSENT_REGISTERED)
+        self.assertIsNone(result["conflict"])
+        self.assertEqual(self.box.consents["CONS-T2D-LOCAL"]["case_id"], "CASE-T2D")
+
+    def test_exact_replay_returns_original_record(self):
+        result = reimport_consent(self.box)
+        self.assertEqual(result["outcome"], CONSENT_REPLAYED)
+        self.assertIs(result["grant"], self.box.consents["CONS-AML-TEACH"])
+        self.assertIsNone(result["conflict"])
+        grant = self.box.consents["CONS-AML-TEACH"]
+        self.assertEqual(grant["replay_count"], 1)
+        self.assertEqual(self.box.consent_conflicts, [])
+        self.assertTrue(any(entry["action"] == "同意重放"
+                            for entry in self.box.audit))
+
+    def test_cross_case_reuse_registers_conflict_and_keeps_first_fact(self):
+        # 批量导入事故：另一个病例包误用了同一编号
+        result = reimport_consent(self.box, case_id="CASE-T2D")
+        self.assertEqual(result["outcome"], CONSENT_CONFLICT)
+        self.assertEqual(result["conflict"]["changed_fields"], ["case_id"])
+        self.assertEqual(result["conflict"]["status"], CONFLICT_PENDING)
+        # 首次事实保留：第一门课程下一次签发切片不再被误判为无有效同意
+        grant = self.box.consents["CONS-AML-TEACH"]
+        self.assertEqual(grant["case_id"], "CASE-AML")
+        session = self.box.issue_slice("S-LIN", "TASK-LOCAL-Q1", self.now)
+        self.assertEqual(session["status"], STATUS_SANDBOX)
+        # 后到内容不获得能力：CASE-T2D 依旧没有有效同意
+        self.box.add_snapshot("CASE-T2D", 1, [{"age": 55, "diagnosis": "T2D"}],
+                              identity_fields=[], released_at=T("2026-03-01T00:00:00"))
+        self.box.create_task("TASK-T2D-Q1", "C-LOCAL", "CASE-T2D",
+                             ["age", "diagnosis"], "POL-K5", "ENV-SCANPY",
+                             now=self.now)
+        with self.assertRaises(AuthorizationError):
+            self.box.issue_slice("S-LIN", "TASK-T2D-Q1", self.now)
+
+    def test_same_case_changed_scope_registers_conflict(self):
+        # 同病例换范围：通用授权被改成课程专用
+        result = reimport_consent(self.box, course_id="C-LOCAL")
+        self.assertEqual(result["outcome"], CONSENT_CONFLICT)
+        self.assertEqual(result["conflict"]["changed_fields"], ["course_id"])
+        # 首次事实是“教学通用”：跨校课程照常签发（若被覆盖将失去授权）
+        self.assertIsNone(self.box.consents["CONS-AML-TEACH"]["course_id"])
+        session = self.box.issue_slice("S-WANG", "TASK-CROSS-Q1", self.now)
+        self.assertEqual(session["status"], STATUS_SANDBOX)
+
+    def test_any_key_field_change_registers_conflict(self):
+        variants = [
+            ({"case_id": "CASE-T2D"}, ["case_id"]),
+            ({"course_id": "C-LOCAL"}, ["course_id"]),
+            ({"granted_at": T("2026-03-01T00:00:00")}, ["granted_at"]),
+            ({"scope_note": "改写后的授权说明"}, ["scope_note"]),
+        ]
+        for overrides, expected_fields in variants:
+            with self.subTest(overrides=overrides):
+                box = Sandbox.from_seed(SEED)
+                result = reimport_consent(box, **overrides)
+                self.assertEqual(result["outcome"], CONSENT_CONFLICT)
+                self.assertEqual(result["conflict"]["changed_fields"],
+                                 expected_fields)
+                grant = box.consents["CONS-AML-TEACH"]
+                self.assertEqual(grant["case_id"], "CASE-AML")
+                self.assertIsNone(grant["course_id"])
+                self.assertEqual(grant["granted_at"], CONSENT_GRANTED)
+                self.assertEqual(grant["scope_note"], CONSENT_NOTE)
+
+    def test_conflict_does_not_overwrite_authorization_flags_or_audit(self):
+        before_grant = dict(self.box.consents["CONS-AML-TEACH"])
+        before_flags = {aid: list(a["risk_flags"])
+                        for aid, a in self.box.assignments.items()}
+        before_audit = [dict(entry) for entry in self.box.audit]
+        reimport_consent(self.box, case_id="CASE-T2D")
+        # 已提交授权原样保留
+        self.assertEqual(dict(self.box.consents["CONS-AML-TEACH"]), before_grant)
+        # 风险标记不受影响
+        after_flags = {aid: list(a["risk_flags"])
+                       for aid, a in self.box.assignments.items()}
+        self.assertEqual(after_flags, before_flags)
+        # 审计只追加、不改写
+        self.assertEqual(self.box.audit[:len(before_audit)], before_audit)
+        self.assertTrue(any(entry["action"] == "同意冲突"
+                            for entry in self.box.audit[len(before_audit):]))
+
+
+class ConsentRaceTest(unittest.TestCase):
+    """撤回、课程到期、导出检查与导入并发：一律按已提交事实决定结果。"""
+
+    WITHDRAW_AT = T("2026-05-05T12:00:00")
+
+    def setUp(self):
+        self.box = Sandbox.from_seed(SEED)
+
+    def test_replay_after_withdrawal_does_not_resurrect_consent(self):
+        self.box.withdraw_consent("CONS-AML-TEACH", self.WITHDRAW_AT)
+        # 撤回后补发完全一致的导入：返回原记录，但撤回事实不变
+        result = reimport_consent(self.box)
+        self.assertEqual(result["outcome"], CONSENT_REPLAYED)
+        self.assertEqual(result["grant"]["withdrawn_at"], self.WITHDRAW_AT)
+        with self.assertRaises(AuthorizationError):
+            self.box.issue_slice("S-LIN", "TASK-LOCAL-Q1", T("2026-05-06T09:00:00"))
+
+    def test_changed_import_after_withdrawal_stays_powerless(self):
+        self.box.withdraw_consent("CONS-AML-TEACH", self.WITHDRAW_AT)
+        # 后到内容试图把授权时间改到撤回之后：只登记冲突，已撤回事实不动
+        result = reimport_consent(self.box, granted_at=T("2026-05-06T00:00:00"))
+        self.assertEqual(result["outcome"], CONSENT_CONFLICT)
+        self.assertEqual(result["conflict"]["changed_fields"], ["granted_at"])
+        self.assertEqual(self.box.consents["CONS-AML-TEACH"]["withdrawn_at"],
+                         self.WITHDRAW_AT)
+        with self.assertRaises(AuthorizationError):
+            self.box.issue_slice("S-WANG", "TASK-CROSS-Q1", T("2026-05-06T09:00:00"))
+
+    def test_export_check_uses_committed_facts_during_import_race(self):
+        day_before = T("2026-05-04T09:00:00")
+        session = self.box.issue_slice("S-LIN", "TASK-LOCAL-Q1", day_before,
+                                       ttl_minutes=2880)
+        self.box.withdraw_consent("CONS-AML-TEACH", self.WITHDRAW_AT)
+        reimport_consent(self.box, granted_at=T("2026-05-06T00:00:00"))
+        record = self.box.request_export(
+            "EXP-RACE", "S-LIN", session["id"],
+            [{"key": "AML-M2", "count": 5}], ["diagnosis"], T("2026-05-06T10:00:00"))
+        self.assertEqual(record["decision"], EXPORT_BLOCKED)
+        self.assertIn("同意撤回", record["reasons"])
+
+    def test_expiry_race_import_does_not_restore_access(self):
+        # 跨校课程到期收权后，冲突导入不能让该课程恢复能力
+        self.box.sweep_expired(T("2026-05-16T00:00:00"))
+        result = reimport_consent(self.box, course_id="C-CROSS")
+        self.assertEqual(result["outcome"], CONSENT_CONFLICT)
+        with self.assertRaises(AuthorizationError):
+            self.box.issue_slice("S-WANG", "TASK-CROSS-Q1", T("2026-05-16T09:00:00"))
+
+
+class ConsentCorrectionTest(unittest.TestCase):
+    """授权人员可追加更正记录并裁定冲突，但旧记录不可改写。"""
+
+    def setUp(self):
+        self.box = Sandbox.from_seed(SEED)
+        self.now = T("2026-04-02T10:00:00")
+
+    def test_privileged_correction_appends_without_rewriting(self):
+        conflict = reimport_consent(self.box, case_id="CASE-T2D")["conflict"]
+        before = dict(self.box.consents["CONS-AML-TEACH"])
+        correction = self.box.correct_consent(
+            "CONS-AML-TEACH", "D-ADMIN",
+            "确认首次登记有效，后到病例包系误装，退回重发",
+            self.now, resolves=conflict["id"])
+        grant = self.box.consents["CONS-AML-TEACH"]
+        # 旧记录关键字段一律未改写
+        for field in ("case_id", "course_id", "granted_at", "scope_note",
+                      "binding_hash", "source"):
+            self.assertEqual(grant[field], before[field])
+        self.assertIn(correction, grant["corrections"])
+        self.assertEqual(conflict["status"], CONFLICT_RESOLVED)
+        self.assertEqual(conflict["resolution"]["by"], "D-ADMIN")
+        # 裁定不等于让后到内容生效：CASE-T2D 仍无有效同意
+        self.assertEqual(self.box._active_consents("CASE-T2D", "C-LOCAL",
+                                                   self.now), [])
+
+    def test_unprivileged_actor_cannot_correct(self):
+        with self.assertRaises(AuthorizationError):
+            self.box.correct_consent("CONS-AML-TEACH", "T-CHEN", "越权更正",
+                                     self.now)
+        with self.assertRaises(AuthorizationError):
+            self.box.correct_consent("CONS-AML-TEACH", "S-LIN", "越权更正",
+                                     self.now)
+
+    def test_resolving_unknown_conflict_is_rejected(self):
+        with self.assertRaises(NotFound):
+            self.box.correct_consent("CONS-AML-TEACH", "D-ADMIN", "裁定",
+                                     self.now, resolves="CONFLICT-9999")
+
+
+class ConsentTraceImpactTest(unittest.TestCase):
+    """追溯解释首次来源、重放与冲突对课程、会话、已评分作业的影响。"""
+
+    def setUp(self):
+        self.box = Sandbox.from_seed(SEED)
+        self.now = T("2026-04-01T09:00:00")
+
+    def test_consent_trace_explains_source_replay_and_conflict_impact(self):
+        session = self.box.issue_slice("S-LIN", "TASK-LOCAL-Q1", self.now)
+        reimport_consent(self.box)  # 完全一致的重放
+        # 另一个病例包误用同一编号；CASE-T2D 已有任务，影响面可指认
+        self.box.add_snapshot("CASE-T2D", 1, [{"age": 55, "diagnosis": "T2D"}],
+                              identity_fields=[], released_at=T("2026-03-01T00:00:00"))
+        self.box.create_task("TASK-T2D-Q1", "C-LOCAL", "CASE-T2D",
+                             ["age", "diagnosis"], "POL-K5", "ENV-SCANPY",
+                             now=self.now)
+        conflict = reimport_consent(self.box, case_id="CASE-T2D")["conflict"]
+
+        info = self.box.consent_trace("CONS-AML-TEACH")
+        self.assertEqual(info["首次登记"]["source"], "种子装载")
+        self.assertEqual(info["首次登记"]["case_id"], "CASE-AML")
+        self.assertEqual(info["重放次数"], 1)
+        self.assertEqual(len(info["冲突"]), 1)
+        entry = info["冲突"][0]
+        self.assertEqual(entry["id"], conflict["id"])
+        self.assertEqual(entry["changed_fields"], ["case_id"])
+        self.assertEqual(entry["status"], CONFLICT_PENDING)
+        # 后到内容若生效会波及 CASE-T2D 所在课程
+        self.assertEqual(entry["影响"]["courses"], ["C-LOCAL"])
+        # 已提交事实当前覆盖两门课程、进行中的会话与已评分作业
+        committed = info["已提交影响"]
+        self.assertEqual(set(committed["courses"]), {"C-LOCAL", "C-CROSS"})
+        self.assertIn(session["id"], committed["sessions"])
+        self.assertEqual(set(committed["graded_assignments"]),
+                         {"AS-LIN-01", "AS-GAO-01"})
+
+    def test_assignment_trace_links_consent_binding_and_conflicts(self):
+        reimport_consent(self.box, case_id="CASE-T2D")
+        consents = self.box.trace("AS-LIN-01")["课程授权"]["consents"]
+        self.assertEqual(consents[0]["source"], "种子装载")
+        self.assertEqual(len(consents[0]["binding_hash"]), 16)
+        self.assertEqual(consents[0]["replay_count"], 0)
+        self.assertEqual(len(consents[0]["conflicts"]), 1)
+
+
+class ConsentSerializationTest(unittest.TestCase):
+    """序列化恢复：绑定关系随快照往返，恢复后再次导入判定一致。"""
+
+    def setUp(self):
+        self.box = Sandbox.from_seed(SEED)
+
+    def _roundtrip(self, box):
+        payload = json.loads(json.dumps(box.to_snapshot(), ensure_ascii=False))
+        return Sandbox.from_snapshot(payload)
+
+    def test_snapshot_roundtrip_preserves_ledgers_and_trace(self):
+        restored = self._roundtrip(self.box)
+        for ledger in (restored.cases, restored.snapshots, restored.consents,
+                       restored.policies, restored.environment_versions,
+                       restored.assignments):
+            self.assertGreater(len(ledger), 0)
+        original = self.box.consents["CONS-AML-TEACH"]
+        recovered = restored.consents["CONS-AML-TEACH"]
+        self.assertEqual(recovered["binding_hash"], original["binding_hash"])
+        self.assertEqual(recovered["source"], "种子装载")
+        self.assertEqual(restored.audit, self.box.audit)
+        trace = restored.trace("AS-LIN-01")
+        self.assertEqual(trace["课程授权"]["consents"][0]["consent_id"],
+                         "CONS-AML-TEACH")
+
+    def test_reimport_after_recovery_keeps_identity_boundary(self):
+        # 恢复前制造一次重放与一次冲突
+        reimport_consent(self.box)
+        reimport_consent(self.box, case_id="CASE-T2D")
+        restored = self._roundtrip(self.box)
+        # 恢复后完全一致仍是重放，且重放次数连续
+        result = reimport_consent(restored)
+        self.assertEqual(result["outcome"], CONSENT_REPLAYED)
+        self.assertEqual(restored.consents["CONS-AML-TEACH"]["replay_count"], 2)
+        # 恢复后关键字段变化仍登记冲突，首次事实不丢
+        result = reimport_consent(restored, course_id="C-LOCAL")
+        self.assertEqual(result["outcome"], CONSENT_CONFLICT)
+        self.assertIsNone(restored.consents["CONS-AML-TEACH"]["course_id"])
+        self.assertEqual(len(restored.consent_conflicts), 2)
+        # 恢复后已提交事实照常支撑切片签发
+        session = restored.issue_slice("S-LIN", "TASK-LOCAL-Q1",
+                                       T("2026-04-01T09:00:00"))
+        self.assertEqual(session["status"], STATUS_SANDBOX)
+
+    def test_recovery_from_legacy_data_without_binding(self):
+        # 旧格式：同意记录缺少绑定摘要、来源等字段，恢复时按关键字段补齐
+        payload = json.loads(json.dumps(self.box.to_snapshot(),
+                                        ensure_ascii=False))
+        for key in ("binding_hash", "source", "registered_at", "replay_count",
+                    "replays", "corrections"):
+            payload["consents"][0].pop(key, None)
+        payload.pop("consent_conflicts", None)
+        restored = Sandbox.from_snapshot(payload)
+        result = reimport_consent(restored)
+        self.assertEqual(result["outcome"], CONSENT_REPLAYED)
+        result = reimport_consent(restored, case_id="CASE-T2D")
+        self.assertEqual(result["outcome"], CONSENT_CONFLICT)
+        self.assertEqual(restored.consents["CONS-AML-TEACH"]["case_id"],
+                         "CASE-AML")
 
 
 if __name__ == "__main__":

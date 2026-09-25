@@ -19,14 +19,20 @@
 4. 跨校课程到期后，注册关系与沙箱会话自动收回；
 5. 病例勘误、工具升级只影响之后创建的新任务；已评分作业保留当时环境指纹，
    另以风险标记标出后续变化；同意撤回则即时阻断相关导出并撤回会话；
-6. 任一结论都可溯源到：数据范围、处理步骤、课程授权、教师复核四部分。
+6. 任一结论都可溯源到：数据范围、处理步骤、课程授权、教师复核四部分；
+7. 同意编号首次落账即绑定病例、课程范围、授权时间与内容摘要；完全一致的重复导入
+   按重放返回原记录，任一关键字段变化只登记冲突、不改写已提交事实；冲突未裁定前
+   后到内容不获得能力，授权人员只能追加更正记录；账本可序列化恢复，
+   恢复后再次导入的判定与恢复前一致。
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -42,6 +48,17 @@ STATUS_REVOKED = "已撤权"
 EXPORT_APPROVED = "通过"
 EXPORT_BLOCKED = "阻断"
 ASSIGNMENT_OPEN = "进行中"
+
+# 同意登记结果与冲突状态（与 fixtures/domain.json 的词汇一致）
+CONSENT_REGISTERED = "已登记"
+CONSENT_REPLAYED = "重放"
+CONSENT_CONFLICT = "冲突"
+CONFLICT_PENDING = "待裁定"
+CONFLICT_RESOLVED = "已裁定"
+# 同意编号首次落账后即绑定的关键字段：病例、课程范围、授权时间、内容摘要
+CONSENT_KEY_FIELDS = ("case_id", "course_id", "granted_at", "scope_note")
+# 可追加同意更正记录的角色
+CONSENT_CORRECTORS = ("数据管理员", "隐私审核员")
 
 
 class SandboxError(Exception):
@@ -70,6 +87,32 @@ def digest(value: Any, length: int = 16) -> str:
     return hashlib.sha256(canon(value).encode("utf-8")).hexdigest()[:length]
 
 
+def _consent_binding(case_id: str, course_id: Optional[str],
+                     granted_at: datetime, scope_note: str) -> dict:
+    """同意编号绑定的关键字段（病例、课程范围、授权时间、内容摘要）。"""
+    return {
+        "case_id": case_id,
+        "course_id": course_id,
+        "granted_at": granted_at.isoformat(),
+        "scope_note": scope_note,
+    }
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    raise TypeError(f"不可序列化的类型：{type(value)!r}")
+
+
+def _serialized(method):
+    """串行化写入口与判定入口：与导入并发时按已提交事实决定结果。"""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 def _apply_transform(value: Any, rule: str) -> Any:
     if rule == "drop":
         return None
@@ -91,6 +134,8 @@ class Sandbox:
         # 快照按 (病例, 版本) 存放，任何版本一经发布不可改写
         self.snapshots: dict[tuple[str, int], dict] = {}
         self.consents: dict[str, dict] = {}
+        # 同意编号冲突登记：追加式账本，只记录不覆盖已提交事实
+        self.consent_conflicts: list[dict] = []
         self.policies: dict[str, dict] = {}
         # 分析环境按 (镜像, 版本) 存放；任务创建时钉住当时版本，升级不回溯
         self.environment_versions: dict[tuple[str, int], dict] = {}
@@ -102,6 +147,8 @@ class Sandbox:
         self.teacher_courses: list[dict] = []
         self.audit: list[dict] = []
         self._seq = 0
+        # 导入、撤回、到期收权、切片签发、导出检查共用：并发时按已提交事实判定
+        self._lock = threading.RLock()
 
     # ---- 装载 -----------------------------------------------------------
 
@@ -145,6 +192,7 @@ class Sandbox:
                 course_id=grant.get("course_id"),
                 granted_at=parse_time(grant["granted_at"]),
                 scope_note=grant.get("scope_note", ""),
+                source="种子装载",
             )
         for enrollment in data.get("enrollments", []):
             box.enroll(enrollment["student_id"], enrollment["course_id"],
@@ -330,19 +378,114 @@ class Sandbox:
             raise NotFound(f"分析环境 {env_id}:v{version} 不存在")
         return record
 
+    @_serialized
     def grant_consent(self, consent_id: str, case_id: str,
                       course_id: Optional[str], granted_at: datetime,
-                      scope_note: str = "") -> dict:
-        grant = {
-            "id": consent_id,
-            "case_id": case_id,
-            "course_id": course_id,  # None 表示覆盖所有教学用途
-            "granted_at": granted_at,
-            "withdrawn_at": None,
-            "scope_note": scope_note,
+                      scope_note: str = "", source: str = "导入",
+                      now: Optional[datetime] = None) -> dict:
+        """登记数据使用同意（批量导入入口）。
+
+        编号首次落账即与病例、课程范围、授权时间、内容摘要绑定：
+        完全一致的重复导入按“重放”返回首次记录；任一关键字段不同，
+        保留首次事实并登记冲突——裁定之前后到内容不获得任何能力，
+        已提交的授权、风险标记与审计一律不被覆盖。
+        """
+        registered_at = now or granted_at
+        incoming = _consent_binding(case_id, course_id, granted_at, scope_note)
+        existing = self.consents.get(consent_id)
+        if existing is None:
+            grant = {
+                "id": consent_id,
+                "case_id": case_id,
+                "course_id": course_id,  # None 表示覆盖所有教学用途
+                "granted_at": granted_at,
+                "withdrawn_at": None,
+                "scope_note": scope_note,
+                "binding_hash": digest(incoming),
+                "source": source,
+                "registered_at": registered_at,
+                "replay_count": 0,
+                "replays": [],
+                "corrections": [],
+            }
+            self.consents[consent_id] = grant
+            self.audit.append({
+                "at": registered_at.isoformat(), "action": "同意登记",
+                "consent_id": consent_id, "source": source,
+                "binding_hash": grant["binding_hash"],
+            })
+            return {"consent_id": consent_id, "outcome": CONSENT_REGISTERED,
+                    "grant": grant, "conflict": None}
+        committed = _consent_binding(existing["case_id"], existing["course_id"],
+                                     existing["granted_at"], existing["scope_note"])
+        changed = [field for field in CONSENT_KEY_FIELDS
+                   if incoming[field] != committed[field]]
+        if not changed:
+            # 完全一致的重放：返回首次记录，授权事实不变（已撤回的不会因此复活）
+            existing["replay_count"] += 1
+            existing["replays"].append(
+                {"at": registered_at.isoformat(), "source": source})
+            self.audit.append({
+                "at": registered_at.isoformat(), "action": "同意重放",
+                "consent_id": consent_id, "source": source,
+            })
+            return {"consent_id": consent_id, "outcome": CONSENT_REPLAYED,
+                    "grant": existing, "conflict": None}
+        # 关键字段变化：保留首次事实，登记冲突；后到内容在裁定前无任何能力
+        conflict = {
+            "id": self._new_id("CONFLICT"),
+            "consent_id": consent_id,
+            "at": registered_at.isoformat(),
+            "source": source,
+            "committed": committed,
+            "incoming": incoming,
+            "changed_fields": changed,
+            "status": CONFLICT_PENDING,
+            "resolution": None,
         }
-        self.consents[consent_id] = grant
-        return grant
+        self.consent_conflicts.append(conflict)
+        self.audit.append({
+            "at": registered_at.isoformat(), "action": "同意冲突",
+            "consent_id": consent_id, "conflict_id": conflict["id"],
+            "changed_fields": changed, "source": source,
+        })
+        return {"consent_id": consent_id, "outcome": CONSENT_CONFLICT,
+                "grant": existing, "conflict": conflict}
+
+    @_serialized
+    def correct_consent(self, consent_id: str, actor_id: str, note: str,
+                        now: datetime, resolves: Optional[str] = None) -> dict:
+        """授权人员追加更正记录：只追加，不改写已落账内容；可顺带裁定冲突。
+
+        更正记录用于说明裁定结论（例如确认首次登记有效、后到包退回重发）；
+        确需变更授权内容时，应撤回旧编号并以新编号重新登记，旧记录永远保留。
+        """
+        grant = self.consents.get(consent_id)
+        if grant is None:
+            raise NotFound(f"未知同意记录：{consent_id}")
+        actor = self.actors.get(actor_id, {"roles": []})
+        if not any(role in CONSENT_CORRECTORS for role in actor.get("roles", [])):
+            raise AuthorizationError("只有数据管理员或隐私审核员可以追加同意更正记录")
+        target = None
+        if resolves is not None:
+            for conflict in self.consent_conflicts:
+                if conflict["id"] == resolves and conflict["consent_id"] == consent_id:
+                    target = conflict
+                    break
+            if target is None:
+                raise NotFound(f"未知同意冲突：{resolves}")
+        correction = {"at": now.isoformat(), "actor_id": actor_id,
+                      "note": note, "resolves": resolves}
+        grant["corrections"].append(correction)
+        if target is not None:
+            target["status"] = CONFLICT_RESOLVED
+            target["resolution"] = {"by": actor_id, "at": now.isoformat(),
+                                    "note": note}
+        self.audit.append({
+            "at": now.isoformat(), "action": "同意更正",
+            "consent_id": consent_id, "actor_id": actor_id, "resolves": resolves,
+        })
+        return correction
 
     def enroll(self, student_id: str, course_id: str,
                status: str = STATUS_PENDING) -> dict:
@@ -425,6 +568,7 @@ class Sandbox:
         course = self.courses[course_id]
         return course["starts_at"] <= now < course["ends_at"]
 
+    @_serialized
     def sweep_expired(self, now: datetime) -> list[str]:
         """到期收权：课程窗口结束后，注册关系与进行中的沙箱会话自动收回。
 
@@ -466,6 +610,7 @@ class Sandbox:
             projected.append(item)
         return projected
 
+    @_serialized
     def issue_slice(self, student_id: str, task_id: str, now: datetime,
                     ttl_minutes: int = 240) -> dict:
         """在限时沙箱中签发与任务教学目标匹配的数据切片。"""
@@ -600,6 +745,7 @@ class Sandbox:
 
     # ---- 导出与披露检查 -------------------------------------------------
 
+    @_serialized
     def request_export(self, export_id: str, student_id: str, slice_id: str,
                        groups: list[dict], columns: list[str], now: datetime,
                        assignment_id: Optional[str] = None) -> dict:
@@ -667,6 +813,7 @@ class Sandbox:
 
     # ---- 同意撤回：即时效力 ---------------------------------------------
 
+    @_serialized
     def withdraw_consent(self, consent_id: str, now: datetime) -> dict:
         """撤回同意：进行中的相关会话立即撤回，待披露导出阻断，受影响作业列清。
 
@@ -812,6 +959,11 @@ class Sandbox:
                 "withdrawn_at": grant["withdrawn_at"].isoformat()
                 if grant["withdrawn_at"] else None,
                 "scope": "课程专用" if grant["course_id"] else "教学通用",
+                "source": grant["source"],
+                "binding_hash": grant["binding_hash"],
+                "replay_count": grant["replay_count"],
+                "conflicts": [conflict["id"] for conflict in self.consent_conflicts
+                              if conflict["consent_id"] == grant["id"]],
             })
         return {
             "assignment_id": assignment_id,
@@ -845,6 +997,59 @@ class Sandbox:
             "fingerprint": assignment["fingerprint"],
         }
 
+    def _consent_impact(self, case_id: str, course_id: Optional[str]) -> dict:
+        """某份同意内容（病例+课程范围）当前覆盖的课程、会话与已评分作业。"""
+        task_ids = set()
+        courses = set()
+        for task in self.tasks.values():
+            if task["case_id"] != case_id:
+                continue
+            if course_id is not None and task["course_id"] != course_id:
+                continue
+            task_ids.add(task["id"])
+            courses.add(task["course_id"])
+        sessions = sorted(session["id"] for session in self.sessions.values()
+                          if session["task_id"] in task_ids)
+        graded = sorted(assignment["id"] for assignment in self.assignments.values()
+                        if assignment["task_id"] in task_ids
+                        and assignment["status"] == STATUS_GRADED)
+        return {"courses": sorted(courses), "sessions": sessions,
+                "graded_assignments": graded}
+
+    def consent_trace(self, consent_id: str) -> dict:
+        """解释同意编号的首次来源、重放与冲突，及各自影响的课程、会话、已评分作业。"""
+        grant = self.consents.get(consent_id)
+        if grant is None:
+            raise NotFound(f"未知同意记录：{consent_id}")
+        conflicts = []
+        for conflict in self.consent_conflicts:
+            if conflict["consent_id"] != consent_id:
+                continue
+            entry = dict(conflict)
+            # 后到内容若生效会波及的课程、会话与已评分作业
+            entry["影响"] = self._consent_impact(conflict["incoming"]["case_id"],
+                                               conflict["incoming"]["course_id"])
+            conflicts.append(entry)
+        return {
+            "consent_id": consent_id,
+            "首次登记": {
+                "case_id": grant["case_id"],
+                "course_id": grant["course_id"],
+                "granted_at": grant["granted_at"].isoformat(),
+                "scope_note": grant["scope_note"],
+                "binding_hash": grant["binding_hash"],
+                "source": grant["source"],
+                "registered_at": grant["registered_at"].isoformat(),
+            },
+            "withdrawn_at": grant["withdrawn_at"].isoformat()
+            if grant["withdrawn_at"] else None,
+            "重放次数": grant["replay_count"],
+            "重放记录": list(grant["replays"]),
+            "冲突": conflicts,
+            "更正记录": list(grant["corrections"]),
+            "已提交影响": self._consent_impact(grant["case_id"], grant["course_id"]),
+        }
+
     # ---- 查询 -----------------------------------------------------------
 
     def assignments_for_case(self, case_id: str) -> list[dict]:
@@ -861,6 +1066,107 @@ class Sandbox:
                     "risk_flags": assignment["risk_flags"],
                 })
         return result
+
+    # ---- 序列化与恢复 ---------------------------------------------------
+
+    def to_snapshot(self) -> dict:
+        """把全部账本与运行记录序列化为纯 JSON 结构。
+
+        恢复后同意编号的绑定关系、重放次数与冲突账保持不变，
+        再次导入的判定结果与恢复前一致。
+        """
+        payload = {
+            "format": 1,
+            "seq": self._seq,
+            "actors": list(self.actors.values()),
+            "courses": list(self.courses.values()),
+            "cases": list(self.cases.values()),
+            "snapshots": list(self.snapshots.values()),
+            "consents": list(self.consents.values()),
+            "consent_conflicts": self.consent_conflicts,
+            "policies": list(self.policies.values()),
+            "environments": list(self.environment_versions.values()),
+            "tasks": list(self.tasks.values()),
+            "assignments": list(self.assignments.values()),
+            "sessions": list(self.sessions.values()),
+            "exports": list(self.exports.values()),
+            "enrollments": self.enrollments,
+            "teacher_courses": self.teacher_courses,
+            "audit": self.audit,
+        }
+        return json.loads(json.dumps(payload, ensure_ascii=False,
+                                     default=_json_default))
+
+    @classmethod
+    def from_snapshot(cls, data: dict) -> "Sandbox":
+        """从 ``to_snapshot`` 的产出恢复沙箱；兼容缺少同意绑定信息的旧数据。"""
+        box = cls()
+        box._seq = data.get("seq", 0)
+        for actor in data.get("actors", []):
+            box.actors[actor["id"]] = dict(actor)
+        for course in data.get("courses", []):
+            record = dict(course)
+            record["starts_at"] = parse_time(record["starts_at"])
+            record["ends_at"] = parse_time(record["ends_at"])
+            box.courses[record["id"]] = record
+        for case in data.get("cases", []):
+            box.cases[case["id"]] = dict(case)
+        for snapshot in data.get("snapshots", []):
+            record = dict(snapshot)
+            record["released_at"] = parse_time(record["released_at"])
+            box.snapshots[(record["case_id"], record["version"])] = record
+        for grant in data.get("consents", []):
+            record = dict(grant)
+            record["granted_at"] = parse_time(record["granted_at"])
+            record["withdrawn_at"] = (parse_time(record["withdrawn_at"])
+                                      if record.get("withdrawn_at") else None)
+            # 兼容既有数据：缺少绑定信息的旧记录按关键字段补齐
+            record.setdefault("scope_note", "")
+            record["source"] = record.get("source", "恢复装载")
+            record["registered_at"] = (parse_time(record["registered_at"])
+                                       if record.get("registered_at")
+                                       else record["granted_at"])
+            record["replay_count"] = record.get("replay_count", 0)
+            record["replays"] = record.get("replays", [])
+            record["corrections"] = record.get("corrections", [])
+            if not record.get("binding_hash"):
+                record["binding_hash"] = digest(_consent_binding(
+                    record["case_id"], record["course_id"],
+                    record["granted_at"], record["scope_note"]))
+            box.consents[record["id"]] = record
+        box.consent_conflicts = [dict(conflict)
+                                 for conflict in data.get("consent_conflicts", [])]
+        for policy in data.get("policies", []):
+            box.policies[policy["id"]] = dict(policy)
+        for env in data.get("environments", []):
+            record = dict(env)
+            record["released_at"] = parse_time(record["released_at"])
+            box.environment_versions[(record["id"], record["version"])] = record
+        for task in data.get("tasks", []):
+            record = dict(task)
+            record["created_at"] = parse_time(record["created_at"])
+            box.tasks[record["id"]] = record
+        for assignment in data.get("assignments", []):
+            record = dict(assignment)
+            record["submitted_at"] = parse_time(record["submitted_at"])
+            record["graded_at"] = (parse_time(record["graded_at"])
+                                   if record.get("graded_at") else None)
+            box.assignments[record["id"]] = record
+        for session in data.get("sessions", []):
+            record = dict(session)
+            record["issued_at"] = parse_time(record["issued_at"])
+            record["expires_at"] = parse_time(record["expires_at"])
+            box.sessions[record["id"]] = record
+        for export in data.get("exports", []):
+            record = dict(export)
+            record["requested_at"] = parse_time(record["requested_at"])
+            record["decided_at"] = (parse_time(record["decided_at"])
+                                    if record.get("decided_at") else None)
+            box.exports[record["id"]] = record
+        box.enrollments = [dict(item) for item in data.get("enrollments", [])]
+        box.teacher_courses = [dict(item) for item in data.get("teacher_courses", [])]
+        box.audit = [dict(item) for item in data.get("audit", [])]
+        return box
 
 
 def self_check(seed_path: str | Path) -> None:

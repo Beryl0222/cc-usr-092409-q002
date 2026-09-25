@@ -4,7 +4,8 @@
     {"id": "S-WANG", "name": "王学生", "roles": ["student"], "institution": "合作医科大学"},
     {"id": "S-GAO", "name": "高学生", "roles": ["student"], "institution": "合作医科大学"},
     {"id": "T-CHEN", "name": "陈教师", "roles": ["teacher"], "institution": "本校医学院"},
-    {"id": "T-ZHAO", "name": "赵教师", "roles": ["teacher"], "institution": "合作医科大学"}
+    {"id": "T-ZHAO", "name": "赵教师", "roles": ["teacher"], "institution": "合作医科大学"},
+    {"id": "D-ADMIN", "name": "周管理员", "roles": ["数据管理员"], "institution": "本校医学院"}
   ],
   "courses": [
     {
